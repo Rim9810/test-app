@@ -10,7 +10,6 @@ from argon2.exceptions import VerifyMismatchError
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Cấu hình bảo mật ngầm ở Backend (Argon2id + Pepper)
 PEPPER_SECRET = os.environ.get("APP_PEPPER_SECRET", "secret_server_pepper_key_2026")
 
 ph = PasswordHasher(
@@ -31,13 +30,8 @@ def apply_pepper(password: str) -> str:
     ).hexdigest()
 
 
-# =====================================================================
-# CẤU HÌNH RATE LIMIT: TỐI ĐA 5 LẦN ĐĂNG NHẬP SAI TRONG 3 PHÚT (180 GIÂY)
-# =====================================================================
 MAX_FAILED_ATTEMPTS = 5
-RATE_LIMIT_WINDOW = 180  # 3 phút = 180 giây
-
-# Lưu danh sách các mốc thời gian (timestamp) đăng nhập sai theo từng IP và Username
+RATE_LIMIT_WINDOW = 180
 FAILED_LOGIN_LOG = {}
 
 
@@ -56,7 +50,6 @@ def clean_and_get_attempts(key: str, now: float) -> list:
 
 
 def check_rate_limit(ip: str, username: str) -> int:
-    """Kiểm tra xem IP hoặc Username đã chạm ngưỡng 5 lần sai trong 3 phút chưa. Trả về số giây cần chờ."""
     now = time.time()
     ip_attempts = clean_and_get_attempts(f"ip:{ip}", now)
     user_attempts = clean_and_get_attempts(f"user:{username.lower()}", now) if username else []
@@ -68,7 +61,6 @@ def check_rate_limit(ip: str, username: str) -> int:
 
 
 def record_failed_attempt(ip: str, username: str) -> tuple[int, int]:
-    """Ghi nhận 1 lần đăng nhập sai. Trả về (số lần còn lại, số giây bị khóa nếu vừa chạm ngưỡng 5 lần)."""
     now = time.time()
     ip_key = f"ip:{ip}"
     ip_attempts = clean_and_get_attempts(ip_key, now)
@@ -89,13 +81,11 @@ def record_failed_attempt(ip: str, username: str) -> tuple[int, int]:
 
 
 def clear_failed_attempts(ip: str, username: str):
-    """Xóa lịch sử nhập sai sau khi đăng nhập thành công"""
     FAILED_LOGIN_LOG.pop(f"ip:{ip}", None)
     if username:
         FAILED_LOGIN_LOG.pop(f"user:{username.lower()}", None)
 
 
-# Danh sách mật khẩu bị lộ phổ biến (kiểm tra ngầm theo cơ chế k-Anonymity)
 BREACHED_PASSWORDS = {
     "123456", "password", "12345678", "123456789", "12345",
     "qwerty", "qwerty123", "admin123", "iloveyou", "welcome123"
@@ -113,7 +103,6 @@ def is_password_pwned(password: str) -> bool:
     return suffix in HIBP_INDEX.get(prefix, set())
 
 
-# Lưu trữ tài khoản
 USERS_DB = {
     "admin": ph.hash(apply_pepper("AnToan@2026"))
 }
@@ -121,7 +110,7 @@ DUMMY_HASH = USERS_DB["admin"]
 
 
 @app.route("/api/register", methods=["POST"])
-def api_register():gầm ở Backend (Argon2id + Pep
+def api_register():
     data = request.get_json() or {}
     username = data.get("username", "").strip()
     password = data.get("password", "")
@@ -161,7 +150,6 @@ def api_login():
     if not username or not password:
         return jsonify({"error": "Vui lòng nhập tên đăng nhập và mật khẩu."}), 400
 
-    # 1. Kiểm tra Rate Limit trước khi xử lý mật khẩu
     retry_after = check_rate_limit(client_ip, username)
     if retry_after > 0:
         return jsonify({
@@ -169,11 +157,9 @@ def api_login():
             "retry_after": retry_after
         }), 429
 
-    # 2. Tìm tài khoản (không phân biệt hoa thường)
     matched_user = next((u for u in USERS_DB if u.lower() == username.lower()), None)
 
     if not matched_user:
-        # Chạy băm giả để đồng bộ thời gian phản hồi (chống Timing Attack)
         try:
             ph.verify(DUMMY_HASH, apply_pepper(password))
         except VerifyMismatchError:
@@ -373,7 +359,6 @@ HTML_UI = """
   <div class="auth-card">
     <div id="alert-box" class="alert"></div>
 
-    <!-- MÀN HÌNH 1: ĐĂNG NHẬP (HIỂN THỊ MẶC ĐỊNH) -->
     <div id="view-login">
       <div class="auth-header">
         <h1>Đăng nhập</h1>
@@ -397,7 +382,6 @@ HTML_UI = """
       </div>
     </div>
 
-    <!-- MÀN HÌNH 2: ĐĂNG KÝ TÀI KHOẢN -->
     <div id="view-register" class="hidden">
       <div class="auth-header">
         <h1>Tạo tài khoản mới</h1>
@@ -425,7 +409,6 @@ HTML_UI = """
       </div>
     </div>
 
-    <!-- MÀN HÌNH 3: TRANG CHỦ SAU KHI ĐĂNG NHẬP -->
     <div id="view-dashboard" class="hidden">
       <div class="welcome-box">
         <div class="avatar-circle" id="user-avatar">U</div>
