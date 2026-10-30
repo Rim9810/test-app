@@ -1,572 +1,586 @@
+import os
 import time
 import hmac
 import hashlib
-import secrets
-from functools import wraps
-from flask import Flask, request, jsonify, make_response, render_template_string
-from werkzeug.security import generate_password_hash, check_password_hash
-import jwt
+from flask import Flask, request, jsonify, render_template_string
+from werkzeug.middleware.proxy_fix import ProxyFix
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import VerifyMismatchError
 
 app = Flask(__name__)
-JWT_SECRET = secrets.token_hex(32)
-OTP_PEPPER = secrets.token_hex(16)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Băm giả dùng để chống Timing Attack khi username không tồn tại
-DUMMY_HASH = generate_password_hash("dummy_constant_time_defense_password")
+# Cấu hình bảo mật ngầm ở Backend (Argon2id + Pepper)
+PEPPER_SECRET = os.environ.get("APP_PEPPER_SECRET", "secret_server_pepper_key_2026")
+
+ph = PasswordHasher(
+    time_cost=3,
+    memory_cost=65536,
+    parallelism=2,
+    hash_len=32,
+    salt_len=16,
+    type=Type.ID
+)
+
+
+def apply_pepper(password: str) -> str:
+    return hmac.new(
+        PEPPER_SECRET.encode("utf-8"),
+        password.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
 
 # =====================================================================
-# 1. CƠ SỞ DỮ LIỆU GIẢ LẬP TRONG BỘ NHỚ (IN-MEMORY STORE)
+# CẤU HÌNH RATE LIMIT: TỐI ĐA 5 LẦN ĐĂNG NHẬP SAI TRONG 3 PHÚT (180 GIÂY)
 # =====================================================================
-USERS_DB = {
-    "vinh_ptit": {
-        "password_hash": generate_password_hash("AnToan@2026"),
-        "phone": "+84 987 *** 321",
-        "failed_attempts": 0,
-        "lockout_until": 0,
-    }
+MAX_FAILED_ATTEMPTS = 5
+RATE_LIMIT_WINDOW = 180  # 3 phút = 180 giây
+
+# Lưu danh sách các mốc thời gian (timestamp) đăng nhập sai theo từng IP và Username
+FAILED_LOGIN_LOG = {}
+
+
+def get_client_ip() -> str:
+    return request.remote_addr or "127.0.0.1"
+
+
+def clean_and_get_attempts(key: str, now: float) -> list:
+    attempts = FAILED_LOGIN_LOG.get(key, [])
+    valid_attempts = [t for t in attempts if now - t < RATE_LIMIT_WINDOW]
+    if valid_attempts:
+        FAILED_LOGIN_LOG[key] = valid_attempts
+    else:
+        FAILED_LOGIN_LOG.pop(key, None)
+    return valid_attempts
+
+
+def check_rate_limit(ip: str, username: str) -> int:
+    """Kiểm tra xem IP hoặc Username đã chạm ngưỡng 5 lần sai trong 3 phút chưa. Trả về số giây cần chờ."""
+    now = time.time()
+    ip_attempts = clean_and_get_attempts(f"ip:{ip}", now)
+    user_attempts = clean_and_get_attempts(f"user:{username.lower()}", now) if username else []
+
+    wait_ip = int(RATE_LIMIT_WINDOW - (now - ip_attempts[0])) + 1 if len(ip_attempts) >= MAX_FAILED_ATTEMPTS else 0
+    wait_user = int(RATE_LIMIT_WINDOW - (now - user_attempts[0])) + 1 if len(user_attempts) >= MAX_FAILED_ATTEMPTS else 0
+
+    return max(wait_ip, wait_user)
+
+
+def record_failed_attempt(ip: str, username: str) -> tuple[int, int]:
+    """Ghi nhận 1 lần đăng nhập sai. Trả về (số lần còn lại, số giây bị khóa nếu vừa chạm ngưỡng 5 lần)."""
+    now = time.time()
+    ip_key = f"ip:{ip}"
+    ip_attempts = clean_and_get_attempts(ip_key, now)
+    ip_attempts.append(now)
+    FAILED_LOGIN_LOG[ip_key] = ip_attempts
+
+    user_attempts = []
+    if username:
+        user_key = f"user:{username.lower()}"
+        user_attempts = clean_and_get_attempts(user_key, now)
+        user_attempts.append(now)
+        FAILED_LOGIN_LOG[user_key] = user_attempts
+
+    used = max(len(ip_attempts), len(user_attempts))
+    remaining = max(0, MAX_FAILED_ATTEMPTS - used)
+    retry_after = check_rate_limit(ip, username) if remaining == 0 else 0
+    return remaining, retry_after
+
+
+def clear_failed_attempts(ip: str, username: str):
+    """Xóa lịch sử nhập sai sau khi đăng nhập thành công"""
+    FAILED_LOGIN_LOG.pop(f"ip:{ip}", None)
+    if username:
+        FAILED_LOGIN_LOG.pop(f"user:{username.lower()}", None)
+
+
+# Danh sách mật khẩu bị lộ phổ biến (kiểm tra ngầm theo cơ chế k-Anonymity)
+BREACHED_PASSWORDS = {
+    "123456", "password", "12345678", "123456789", "12345",
+    "qwerty", "qwerty123", "admin123", "iloveyou", "welcome123"
 }
 
-# Lưu trữ Rate Limit theo IP: { ip: [timestamp1, timestamp2, ...] }
-RATE_LIMIT_STORE = {}
-RATE_LIMIT_MAX_REQ = 6
-RATE_LIMIT_WINDOW = 30  # giây
-
-# Lưu trữ CAPTCHA phía Server: { captcha_id: {"answer": str, "expires": float} }
-CAPTCHA_STORE = {}
-
-# Lưu trữ phiên chờ xác thực SMS MFA:
-# { mfa_token: {"username": str, "otp_hash": str, "expires": float, "attempts": int} }
-MFA_SESSIONS = {}
-
-# Lưu trữ Refresh Token phục vụ Rotation & Reuse Detection:
-# { token_id: {"username": str, "family_id": str, "used": bool, "revoked": bool, "expires": float} }
-REFRESH_TOKENS = {}
-
-# Hộp thư SMS giả lập để hiển thị lên giao diện Demo
-VIRTUAL_SMS_INBOX = []
+HIBP_INDEX = {}
+for pwd in BREACHED_PASSWORDS:
+    sha1_hex = hashlib.sha1(pwd.encode("utf-8")).hexdigest().upper()
+    HIBP_INDEX.setdefault(sha1_hex[:5], set()).add(sha1_hex[5:])
 
 
-# =====================================================================
-# 2. CÁC HÀM BẢO MẬT HỖ TRỢ (SECURITY HELPERS)
-# =====================================================================
-def hash_otp(otp_code: str) -> str:
-    return hmac.new(OTP_PEPPER.encode(), otp_code.encode(), hashlib.sha256).hexdigest()
+def is_password_pwned(password: str) -> bool:
+    sha1_full = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1_full[:5], sha1_full[5:]
+    return suffix in HIBP_INDEX.get(prefix, set())
 
 
-def create_captcha():
-    a = secrets.randbelow(9) + 1
-    b = secrets.randbelow(9) + 1
-    captcha_id = secrets.token_urlsafe(12)
-    CAPTCHA_STORE[captcha_id] = {
-        "answer": str(a + b),
-        "expires": time.time() + 180
-    }
-    return captcha_id, f"{a} + {b} = ?"
+# Lưu trữ tài khoản
+USERS_DB = {
+    "admin": ph.hash(apply_pepper("AnToan@2026"))
+}
+DUMMY_HASH = USERS_DB["admin"]
 
 
-def verify_captcha(captcha_id: str, user_answer: str) -> bool:
-    if not captcha_id or captcha_id not in CAPTCHA_STORE:
-        return False
-    record = CAPTCHA_STORE.pop(captcha_id)  # One-time use
-    if time.time() > record["expires"]:
-        return False
-    return hmac.compare_digest(record["answer"], str(user_answer).strip())
-
-
-def rate_limit_middleware():
-    ip = request.remote_addr or "127.0.0.1"
-    now = time.time()
-    history = RATE_LIMIT_STORE.get(ip, [])
-    # Lọc các request còn nằm trong cửa sổ thời gian
-    history = [t for t in history if now - t < RATE_LIMIT_WINDOW]
-    if len(history) >= RATE_LIMIT_MAX_REQ:
-        retry_after = int(RATE_LIMIT_WINDOW - (now - history[0])) + 1
-        return jsonify({
-            "error": f"Quá nhiều yêu cầu (Rate Limit). Vui lòng thử lại sau {retry_after} giây.",
-            "retry_after": retry_after
-        }), 429
-    history.append(now)
-    RATE_LIMIT_STORE[ip] = history
-    return None
-
-
-def issue_token_pair(username: str, family_id: str = None):
-    now = time.time()
-    if not family_id:
-        family_id = secrets.token_hex(8)
-
-    # 1. Access Token ngắn hạn (60 giây để dễ kiểm thử)
-    access_payload = {
-        "sub": username,
-        "iat": int(now),
-        "exp": int(now + 60),
-        "jti": secrets.token_hex(8),
-        "type": "access"
-    }
-    access_token = jwt.encode(access_payload, JWT_SECRET, algorithm="HS256")
-
-    # 2. Refresh Token (Quản lý trạng thái Rotation trên Server)
-    refresh_id = secrets.token_urlsafe(32)
-    REFRESH_TOKENS[refresh_id] = {
-        "username": username,
-        "family_id": family_id,
-        "used": False,
-        "revoked": False,
-        "expires": now + 3600
-    }
-    return access_token, refresh_id, family_id
-
-
-def revoke_token_family(family_id: str):
-    """Thu hồi toàn bộ chuỗi Refresh Token cùng họ khi phát hiện bị đánh cắp (Reuse Detection)"""
-    for tid, data in REFRESH_TOKENS.items():
-        if data["family_id"] == family_id:
-            data["revoked"] = True
-
-
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Thiếu Access Token"}), 401
-        token = auth_header.split(" ", 1)[1]
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-            request.user = payload["sub"]
-        except jwt.ExpiredSignatureError:
-            return jsonify({"error": "Access Token đã hết hạn (60s). Hãy gọi Refresh Token!"}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({"error": "Access Token không hợp lệ"}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-
-# =====================================================================
-# 3. CÁC API ĐĂNG NHẬP, MFA & QUẢN LÝ TOKEN
-# =====================================================================
-@app.route("/api/login", methods=["POST"])
-def api_login():
-    # Kiểm tra Rate Limit theo IP
-    rl_resp = rate_limit_middleware()
-    if rl_resp:
-        return rl_resp
-
+@app.route("/api/register", methods=["POST"])
+def api_register():gầm ở Backend (Argon2id + Pep
     data = request.get_json() or {}
     username = data.get("username", "").strip()
     password = data.get("password", "")
-    captcha_id = data.get("captcha_id")
-    captcha_answer = data.get("captcha_answer", "")
+    confirm = data.get("confirm_password", "")
 
-    now = time.time()
-    user = USERS_DB.get(username)
+    if not username or not password:
+        return jsonify({"error": "Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu."}), 400
 
-    # Chống Timing Attack: Nếu user không tồn tại, vẫn chạy hàm băm giả
-    if not user:
-        check_password_hash(DUMMY_HASH, password)
-        cid, c_question = create_captcha()
+    if len(username) < 3:
+        return jsonify({"error": "Tên đăng nhập phải có ít nhất 3 ký tự."}), 400
+
+    if username.lower() in (u.lower() for u in USERS_DB):
+        return jsonify({"error": "Tên đăng nhập này đã được sử dụng."}), 409
+
+    if len(password) < 8:
+        return jsonify({"error": "Mật khẩu phải có ít nhất 8 ký tự."}), 400
+
+    if password != confirm:
+        return jsonify({"error": "Mật khẩu xác nhận không khớp."}), 400
+
+    if is_password_pwned(password):
         return jsonify({
-            "error": "Tên đăng nhập hoặc mật khẩu không chính xác.",
-            "require_captcha": True,
-            "captcha_id": cid,
-            "captcha_question": c_question
+            "error": "Mật khẩu này quá phổ biến hoặc đã bị lộ trong các vụ rò rỉ dữ liệu. Vui lòng chọn mật khẩu khác an toàn hơn."
+        }), 422
+
+    USERS_DB[username] = ph.hash(apply_pepper(password))
+    return jsonify({"message": "Đăng ký tài khoản thành công! Bạn có thể đăng nhập ngay."})
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json() or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    client_ip = get_client_ip()
+
+    if not username or not password:
+        return jsonify({"error": "Vui lòng nhập tên đăng nhập và mật khẩu."}), 400
+
+    # 1. Kiểm tra Rate Limit trước khi xử lý mật khẩu
+    retry_after = check_rate_limit(client_ip, username)
+    if retry_after > 0:
+        return jsonify({
+            "error": f"Bạn đã nhập sai quá {MAX_FAILED_ATTEMPTS} lần trong 3 phút. Vui lòng thử lại sau {retry_after} giây.",
+            "retry_after": retry_after
+        }), 429
+
+    # 2. Tìm tài khoản (không phân biệt hoa thường)
+    matched_user = next((u for u in USERS_DB if u.lower() == username.lower()), None)
+
+    if not matched_user:
+        # Chạy băm giả để đồng bộ thời gian phản hồi (chống Timing Attack)
+        try:
+            ph.verify(DUMMY_HASH, apply_pepper(password))
+        except VerifyMismatchError:
+            pass
+
+        remaining, lock_sec = record_failed_attempt(client_ip, username)
+        if lock_sec > 0:
+            return jsonify({
+                "error": f"Bạn đã nhập sai quá {MAX_FAILED_ATTEMPTS} lần trong 3 phút. Vui lòng thử lại sau {lock_sec} giây.",
+                "retry_after": lock_sec
+            }), 429
+
+        return jsonify({
+            "error": f"Tên đăng nhập hoặc mật khẩu không chính xác. (Còn {remaining} lần thử)"
         }), 401
 
-    # Kiểm tra trạng thái khóa tạm thời (Soft Lockout)
-    if now < user["lockout_until"]:
-        wait_sec = int(user["lockout_until"] - now)
+    try:
+        ph.verify(USERS_DB[matched_user], apply_pepper(password))
+        clear_failed_attempts(client_ip, matched_user)
         return jsonify({
-            "error": f"Tài khoản đang bị tạm khóa chống Brute-force. Thử lại sau {wait_sec} giây."
-        }), 423
-
-    # Nếu đã sai từ 2 lần trở lên, bắt buộc giải đúng CAPTCHA trước khi kiểm tra mật khẩu
-    if user["failed_attempts"] >= 2:
-        if not verify_captcha(captcha_id, captcha_answer):
-            cid, c_question = create_captcha()
+            "message": "Đăng nhập thành công!",
+            "username": matched_user
+        })
+    except VerifyMismatchError:
+        remaining, lock_sec = record_failed_attempt(client_ip, matched_user)
+        if lock_sec > 0:
             return jsonify({
-                "error": "Vui lòng giải đúng mã CAPTCHA bảo mật để tiếp tục.",
-                "require_captcha": True,
-                "captcha_id": cid,
-                "captcha_question": c_question
-            }), 400
+                "error": f"Bạn đã nhập sai quá {MAX_FAILED_ATTEMPTS} lần trong 3 phút. Vui lòng thử lại sau {lock_sec} giây.",
+                "retry_after": lock_sec
+            }), 429
 
-    # Kiểm tra mật khẩu
-    if not check_password_hash(user["password_hash"], password):
-        user["failed_attempts"] += 1
-        # Nếu sai 4 lần liên tiếp -> Khóa tạm thời 60 giây
-        if user["failed_attempts"] >= 4:
-            user["lockout_until"] = now + 60
-            return jsonify({
-                "error": "Nhập sai quá 4 lần! Tài khoản bị khóa tạm thời 60 giây."
-            }), 423
-
-        resp_payload = {"error": "Tên đăng nhập hoặc mật khẩu không chính xác."}
-        if user["failed_attempts"] >= 2:
-            cid, c_question = create_captcha()
-            resp_payload["require_captcha"] = True
-            resp_payload["captcha_id"] = cid
-            resp_payload["captcha_question"] = c_question
-        return jsonify(resp_payload), 401
-
-    # Đăng nhập Bước 1 thành công -> Reset bộ đếm lỗi & Phát sinh SMS OTP
-    user["failed_attempts"] = 0
-    user["lockout_until"] = 0
-
-    otp_code = f"{secrets.randbelow(900000) + 100000}"
-    mfa_token = secrets.token_urlsafe(24)
-    MFA_SESSIONS[mfa_token] = {
-        "username": username,
-        "otp_hash": hash_otp(otp_code),
-        "expires": now + 180,
-        "attempts": 0
-    }
-
-    # Gửi vào hộp thư SMS giả lập
-    VIRTUAL_SMS_INBOX.insert(0, {
-        "to": user["phone"],
-        "time": time.strftime("%H:%M:%S"),
-        "message": f"[AppSec Demo] Mã xác thực OTP của bạn là: {otp_code} (Hiệu lực 3 phút, không chia sẻ cho bất kỳ ai)."
-    })
-
-    return jsonify({
-        "status": "MFA_REQUIRED",
-        "message": f"Đã gửi mã SMS OTP tới số {user['phone']}",
-        "mfa_token": mfa_token,
-        "sms_preview": VIRTUAL_SMS_INBOX[0]
-    })
-
-
-@app.route("/api/verify-otp", methods=["POST"])
-def api_verify_otp():
-    rl_resp = rate_limit_middleware()
-    if rl_resp:
-        return rl_resp
-
-    data = request.get_json() or {}
-    mfa_token = data.get("mfa_token", "")
-    otp_input = data.get("otp", "").strip()
-
-    session = MFA_SESSIONS.get(mfa_token)
-    if not session:
-        return jsonify({"error": "Phiên MFA không hợp lệ hoặc đã bị hủy. Vui lòng đăng nhập lại."}), 401
-
-    if time.time() > session["expires"]:
-        MFA_SESSIONS.pop(mfa_token, None)
-        return jsonify({"error": "Mã OTP đã hết hạn. Vui lòng đăng nhập lại."}), 401
-
-    # Chống Brute-force OTP: Tối đa 3 lần thử cho mỗi mã
-    session["attempts"] += 1
-    if not hmac.compare_digest(session["otp_hash"], hash_otp(otp_input)):
-        remaining = 3 - session["attempts"]
-        if remaining <= 0:
-            MFA_SESSIONS.pop(mfa_token, None)
-            return jsonify({
-                "error": "Bạn đã nhập sai OTP 3 lần! Phiên xác thực bị hủy để chống dò mã."
-            }), 403
-        return jsonify({"error": f"Mã OTP không đúng. Còn {remaining} lần thử."}), 401
-
-    # Xác thực MFA hoàn tất -> Xóa phiên MFA và cấp cặp Token
-    username = session["username"]
-    MFA_SESSIONS.pop(mfa_token, None)
-
-    access_token, refresh_id, family_id = issue_token_pair(username)
-    resp = make_response(jsonify({
-        "status": "AUTHENTICATED",
-        "access_token": access_token,
-        "refresh_token_debug": refresh_id,  # Chỉ hiển thị phục vụ nút bấm Demo Replay Attack
-        "family_id": family_id,
-        "expires_in": 60
-    }))
-    # Lưu Refresh Token vào HttpOnly Cookie
-    resp.set_cookie(
-        "refresh_token",
-        refresh_id,
-        httponly=True,
-        samesite="Strict",
-        secure=False,  # Đặt True trên môi trường HTTPS thực tế
-        max_age=3600
-    )
-    return resp
-
-
-@app.route("/api/refresh", methods=["POST"])
-def api_refresh():
-    data = request.get_json(silent=True) or {}
-    # Hỗ trợ lấy từ Cookie HttpOnly chuẩn hoặc từ tham số giả lập tấn công Replay
-    refresh_id = data.get("override_refresh_token") or request.cookies.get("refresh_token")
-
-    if not refresh_id or refresh_id not in REFRESH_TOKENS:
-        return jsonify({"error": "Refresh Token không tồn tại hoặc không hợp lệ."}), 401
-
-    rt_record = REFRESH_TOKENS[refresh_id]
-
-    # PHÁT HIỆN TÁI SỬ DỤNG (REUSE DETECTION):
-    # Nếu một Refresh Token đã từng được sử dụng (`used == True`) lại bị gửi lên lần nữa
-    if rt_record["used"]:
-        revoke_token_family(rt_record["family_id"])
         return jsonify({
-            "error": "CẢNH BÁO BẢO MẬT: Phát hiện Refresh Token cũ bị tái sử dụng (Token Replay)! Toàn bộ phiên đăng nhập của tài khoản đã bị thu hồi khẩn cấp."
-        }), 403
-
-    if rt_record["revoked"] or time.time() > rt_record["expires"]:
-        return jsonify({"error": "Refresh Token đã bị thu hồi hoặc hết hạn. Vui lòng đăng nhập lại."}), 401
-
-    # Đánh dấu Refresh Token hiện tại là đã dùng và xoay vòng (Rotation) sang mã mới
-    rt_record["used"] = True
-    new_access, new_refresh, family_id = issue_token_pair(
-        rt_record["username"],
-        family_id=rt_record["family_id"]
-    )
-
-    resp = make_response(jsonify({
-        "status": "ROTATED",
-        "access_token": new_access,
-        "old_refresh_token": refresh_id,
-        "refresh_token_debug": new_refresh,
-        "family_id": family_id
-    }))
-    resp.set_cookie(
-        "refresh_token",
-        new_refresh,
-        httponly=True,
-        samesite="Strict",
-        secure=False,
-        max_age=3600
-    )
-    return resp
+            "error": f"Tên đăng nhập hoặc mật khẩu không chính xác. (Còn {remaining} lần thử)"
+        }), 401
 
 
-@app.route("/api/profile", methods=["GET"])
-@require_auth
-def api_profile():
-    return jsonify({
-        "user": request.user,
-        "role": "Security Engineer",
-        "message": "Truy cập tài nguyên bảo vệ thành công bằng JWT Access Token!",
-        "timestamp": time.strftime("%H:%M:%S")
-    })
-
-
-@app.route("/api/logout", methods=["POST"])
-def api_logout():
-    refresh_id = request.cookies.get("refresh_token")
-    if refresh_id and refresh_id in REFRESH_TOKENS:
-        revoke_token_family(REFRESH_TOKENS[refresh_id]["family_id"])
-    resp = make_response(jsonify({"message": "Đã đăng xuất và hủy toàn bộ chuỗi Refresh Token."}))
-    resp.delete_cookie("refresh_token")
-    return resp
-
-
-# =====================================================================
-# 4. GIAO DIỆN DEMO TƯƠNG TÁC (SINGLE-PAGE DASHBOARD)
-# =====================================================================
-HTML_TEMPLATE = """
+HTML_UI = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
   <meta charset="UTF-8">
-  <title>Demo App Login An Toàn (MFA + Anti-BruteForce + Token Rotation)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Đăng nhập hệ thống</title>
   <style>
-    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
-    body { margin: 0; padding: 24px; background: #0f172a; color: #f8fafc; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1100px; margin: 0 auto; }
-    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; }
-    h2 { margin-top: 0; font-size: 18px; color: #38bdf8; }
-    label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }
-    input { width: 100%; padding: 10px; margin-bottom: 14px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; }
-    button { padding: 10px 14px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; background: #0284c7; color: white; margin-right: 6px; margin-bottom: 8px; }
-    button.secondary { background: #475569; }
-    button.danger { background: #dc2626; }
-    .sms-box { background: #064e3b; border: 1px solid #10b981; padding: 12px; border-radius: 8px; margin-top: 10px; font-size: 14px; }
-    .log-box { background: #020617; border: 1px solid #1e293b; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 12px; height: 240px; overflow-y: auto; white-space: pre-wrap; color: #a7f3d0; }
-    .hidden { display: none; }
-    .badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 12px; background: #334155; color: #94a3b8; }
+    * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      color: #1e293b;
+      padding: 16px;
+    }
+    .auth-card {
+      background: #ffffff;
+      width: 100%;
+      max-width: 400px;
+      padding: 36px 32px;
+      border-radius: 16px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
+    }
+    .auth-header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .auth-header h1 {
+      margin: 0 0 8px 0;
+      font-size: 24px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+    .auth-header p {
+      margin: 0;
+      font-size: 14px;
+      color: #64748b;
+    }
+    .form-group {
+      margin-bottom: 18px;
+    }
+    label {
+      display: block;
+      font-size: 13.5px;
+      font-weight: 600;
+      color: #334155;
+      margin-bottom: 6px;
+    }
+    input {
+      width: 100%;
+      padding: 11px 14px;
+      font-size: 14.5px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    input:focus {
+      border-color: #2563eb;
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+    }
+    .btn-primary {
+      width: 100%;
+      padding: 12px;
+      font-size: 15px;
+      font-weight: 600;
+      color: #ffffff;
+      background: #2563eb;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 4px;
+    }
+    .btn-primary:hover {
+      background: #1d4ed8;
+    }
+    .btn-primary:disabled {
+      background: #94a3b8;
+      cursor: not-allowed;
+    }
+    .switch-view {
+      text-align: center;
+      margin-top: 22px;
+      padding-top: 18px;
+      border-top: 1px solid #e2e8f0;
+      font-size: 14px;
+      color: #64748b;
+    }
+    .switch-view a {
+      color: #2563eb;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      margin-left: 4px;
+    }
+    .switch-view a:hover {
+      text-decoration: underline;
+    }
+    .alert {
+      padding: 11px 14px;
+      border-radius: 8px;
+      font-size: 13.5px;
+      margin-bottom: 18px;
+      display: none;
+      line-height: 1.4;
+    }
+    .alert-error {
+      background: #fef2f2;
+      color: #b91c1c;
+      border: 1px solid #fecaca;
+    }
+    .alert-success {
+      background: #f0fdf4;
+      color: #15803d;
+      border: 1px solid #bbf7d0;
+    }
+    .hidden {
+      display: none;
+    }
+    .welcome-box {
+      text-align: center;
+      padding: 10px 0;
+    }
+    .avatar-circle {
+      width: 64px;
+      height: 64px;
+      background: #dbeafe;
+      color: #2563eb;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      font-weight: 700;
+      margin: 0 auto 16px auto;
+    }
+    .btn-outline {
+      width: 100%;
+      padding: 11px;
+      font-size: 14.5px;
+      font-weight: 600;
+      color: #475569;
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 20px;
+    }
+    .btn-outline:hover {
+      background: #f1f5f9;
+    }
   </style>
 </head>
 <body>
-  <div class="grid">
-    <!-- CỘT TRÁI: LUỒNG ĐĂNG NHẬP & MFA -->
-    <div class="card">
-      <h2>1. Cổng Đăng Nhập Đa Lớp</h2>
-      <p style="font-size:13px; color:#94a3b8;">Tài khoản mẫu: <b>vinh_ptit</b> | Mật khẩu: <b>AnToan@2026</b></p>
 
-      <div id="step-login">
-        <label>Tên đăng nhập</label>
-        <input id="username" value="vinh_ptit" />
-        <label>Mật khẩu</label>
-        <input id="password" type="password" value="AnToan@2026" />
+  <div class="auth-card">
+    <div id="alert-box" class="alert"></div>
 
-        <div id="captcha-container" class="hidden">
-          <label id="captcha-question" style="color:#fbbf24; font-weight:bold;"></label>
-          <input id="captcha-answer" placeholder="Nhập kết quả phép tính CAPTCHA" />
+    <!-- MÀN HÌNH 1: ĐĂNG NHẬP (HIỂN THỊ MẶC ĐỊNH) -->
+    <div id="view-login">
+      <div class="auth-header">
+        <h1>Đăng nhập</h1>
+        <p>Chào mừng bạn quay trở lại hệ thống</p>
+      </div>
+
+      <form onsubmit="handleLogin(event)">
+        <div class="form-group">
+          <label for="login-username">Tên đăng nhập</label>
+          <input type="text" id="login-username" placeholder="Nhập tên đăng nhập" required autocomplete="username" />
         </div>
+        <div class="form-group">
+          <label for="login-password">Mật khẩu</label>
+          <input type="password" id="login-password" placeholder="Nhập mật khẩu" required autocomplete="current-password" />
+        </div>
+        <button type="submit" id="btn-login" class="btn-primary">Đăng nhập</button>
+      </form>
 
-        <button onclick="submitLogin()">Đăng nhập (Bước 1)</button>
-        <button class="secondary" onclick="testWrongPassword()">Thử sai mật khẩu (Test CAPTCHA/Lockout)</button>
+      <div class="switch-view">
+        Chưa có tài khoản? <a onclick="switchTab('register')">Đăng ký tài khoản</a>
       </div>
-
-      <div id="step-mfa" class="hidden">
-        <label style="color:#38bdf8; font-weight:bold;">Bước 2: Nhập mã SMS OTP (6 chữ số)</label>
-        <input id="otp-input" placeholder="Nhập 6 số OTP từ hộp thư SMS..." />
-        <button onclick="submitOtp()">Xác nhận OTP</button>
-        <button class="secondary" onclick="resetFlow()">Quay lại</button>
-      </div>
-
-      <h2 style="margin-top:24px;">2. Hộp thư SMS Giả lập (Virtual Phone)</h2>
-      <div id="sms-inbox" class="sms-box">Chưa có tin nhắn SMS nào.</div>
     </div>
 
-    <!-- CỘT PHẢI: QUẢN LÝ TOKEN & KIỂM THỬ TẤN CÔNG -->
-    <div class="card">
-      <h2>3. Quản lý Phiên & Kiểm thử Token Rotation</h2>
-      <p style="font-size:13px;">
-        Trạng thái: <span id="auth-status" class="badge">Chưa xác thực</span><br><br>
-        <b>Access Token (Lưu trên RAM):</b> <span id="access-preview" style="font-family:monospace; font-size:12px; color:#38bdf8;">None</span>
-      </p>
+    <!-- MÀN HÌNH 2: ĐĂNG KÝ TÀI KHOẢN -->
+    <div id="view-register" class="hidden">
+      <div class="auth-header">
+        <h1>Tạo tài khoản mới</h1>
+        <p>Điền thông tin bên dưới để đăng ký</p>
+      </div>
 
-      <button onclick="callProtectedApi()">Gọi API /api/profile</button>
-      <button onclick="rotateRefreshToken()">Làm mới Token (/api/refresh)</button>
-      <button class="danger" onclick="simulateTokenReplay()">Giả lập Đánh cắp & Replay Refresh Token Cũ</button>
-      <button class="secondary" onclick="logout()">Đăng xuất</button>
+      <form onsubmit="handleRegister(event)">
+        <div class="form-group">
+          <label for="reg-username">Tên đăng nhập</label>
+          <input type="text" id="reg-username" placeholder="Tối thiểu 3 ký tự" required autocomplete="username" />
+        </div>
+        <div class="form-group">
+          <label for="reg-password">Mật khẩu</label>
+          <input type="password" id="reg-password" placeholder="Tối thiểu 8 ký tự" required autocomplete="new-password" />
+        </div>
+        <div class="form-group">
+          <label for="reg-confirm">Xác nhận mật khẩu</label>
+          <input type="password" id="reg-confirm" placeholder="Nhập lại mật khẩu" required autocomplete="new-password" />
+        </div>
+        <button type="submit" id="btn-register" class="btn-primary">Đăng ký</button>
+      </form>
 
-      <h2 style="margin-top:18px;">Nhật ký Phản hồi Bảo mật (Security Logs)</h2>
-      <div id="logs" class="log-box">Sẵn sàng kiểm thử...</div>
+      <div class="switch-view">
+        Đã có tài khoản? <a onclick="switchTab('login')">Đăng nhập ngay</a>
+      </div>
+    </div>
+
+    <!-- MÀN HÌNH 3: TRANG CHỦ SAU KHI ĐĂNG NHẬP -->
+    <div id="view-dashboard" class="hidden">
+      <div class="welcome-box">
+        <div class="avatar-circle" id="user-avatar">U</div>
+        <h2 style="margin:0 0 6px 0; color:#0f172a;">Xin chào, <span id="display-username"></span>!</h2>
+        <p style="margin:0; font-size:14px; color:#64748b;">Bạn đã đăng nhập vào hệ thống thành công.</p>
+        <button class="btn-outline" onclick="handleLogout()">Đăng xuất</button>
+      </div>
     </div>
   </div>
 
 <script>
-  let accessTokenInMemory = null; // Lưu trên RAM, tuyệt đối không lưu localStorage
-  let currentMfaToken = null;
-  let currentCaptchaId = null;
-  let previousRefreshToken = null; // Lưu lại mã cũ để minh họa tấn công Replay
+  let lockTimer = null;
 
-  function log(title, data) {
-    const box = document.getElementById("logs");
-    const time = new Date().toLocaleTimeString();
-    box.textContent = `[${time}] ${title}:\n${JSON.stringify(data, null, 2)}\n\n` + box.textContent;
+  function showAlert(message, type) {
+    const box = document.getElementById("alert-box");
+    box.textContent = message;
+    box.className = "alert " + (type === "success" ? "alert-success" : "alert-error");
+    box.style.display = "block";
   }
 
-  async function submitLogin() {
-    const payload = {
-      username: document.getElementById("username").value,
-      password: document.getElementById("password").value,
-      captcha_id: currentCaptchaId,
-      captcha_answer: document.getElementById("captcha-answer").value
+  function hideAlert() {
+    document.getElementById("alert-box").style.display = "none";
+  }
+
+  function startLockoutCountdown(seconds) {
+    const btn = document.getElementById("btn-login");
+    if (lockTimer) clearInterval(lockTimer);
+
+    let remaining = seconds;
+    btn.disabled = true;
+
+    const updateText = () => {
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      const timeStr = mins > 0 ? `${mins} phút ${secs} giây` : `${secs} giây`;
+      btn.textContent = `Tạm khóa (${timeStr})`;
+      showAlert(`Bạn đã nhập sai quá 5 lần trong 3 phút. Vui lòng thử lại sau ${timeStr}.`, "error");
     };
-    const res = await fetch("/api/login", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    log(`POST /api/login (HTTP ${res.status})`, data);
 
-    if (data.require_captcha) {
-      currentCaptchaId = data.captcha_id;
-      document.getElementById("captcha-container").classList.remove("hidden");
-      document.getElementById("captcha-question").textContent = "Xác minh CAPTCHA: " + data.captcha_question;
-      document.getElementById("captcha-answer").value = "";
-    }
-
-    if (data.status === "MFA_REQUIRED") {
-      currentMfaToken = data.mfa_token;
-      document.getElementById("step-login").classList.add("hidden");
-      document.getElementById("step-mfa").classList.remove("hidden");
-      document.getElementById("sms-inbox").innerHTML =
-        `<b>Tới:</b> ${data.sms_preview.to} (${data.sms_preview.time})<br>${data.sms_preview.message}`;
-    }
+    updateText();
+    lockTimer = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) {
+        clearInterval(lockTimer);
+        lockTimer = null;
+        btn.disabled = false;
+        btn.textContent = "Đăng nhập";
+        hideAlert();
+      } else {
+        updateText();
+      }
+    }, 1000);
   }
 
-  function testWrongPassword() {
-    document.getElementById("password").value = "SaiMatKhau123";
-    submitLogin();
+  function switchTab(tab) {
+    if (!lockTimer) hideAlert();
+    document.getElementById("view-login").classList.toggle("hidden", tab !== "login");
+    document.getElementById("view-register").classList.toggle("hidden", tab !== "register");
+    document.getElementById("view-dashboard").classList.toggle("hidden", tab !== "dashboard");
   }
 
-  async function submitOtp() {
-    const res = await fetch("/api/verify-otp", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        mfa_token: currentMfaToken,
-        otp: document.getElementById("otp-input").value
-      })
-    });
-    const data = await res.json();
-    log(`POST /api/verify-otp (HTTP ${res.status})`, data);
+  async function handleLogin(e) {
+    e.preventDefault();
+    if (lockTimer) return;
+    hideAlert();
 
-    if (data.status === "AUTHENTICATED") {
-      accessTokenInMemory = data.access_token;
-      document.getElementById("auth-status").textContent = "Đã xác thực MFA (Family: " + data.family_id + ")";
-      document.getElementById("auth-status").style.background = "#059669";
-      document.getElementById("auth-status").style.color = "#fff";
-      document.getElementById("access-preview").textContent = accessTokenInMemory.slice(0, 36) + "...";
-      resetFlow();
-    }
-  }
+    const btn = document.getElementById("btn-login");
+    btn.disabled = true;
+    btn.textContent = "Đang xử lý...";
 
-  async function callProtectedApi() {
-    const res = await fetch("/api/profile", {
-      headers: accessTokenInMemory ? {"Authorization": "Bearer " + accessTokenInMemory} : {}
-    });
-    const data = await res.json();
-    log(`GET /api/profile (HTTP ${res.status})`, data);
-  }
+    const username = document.getElementById("login-username").value;
+    const password = document.getElementById("login-password").value;
 
-  async function rotateRefreshToken() {
-    const res = await fetch("/api/refresh", { method: "POST" });
-    const data = await res.json();
-    log(`POST /api/refresh (HTTP ${res.status})`, data);
-    if (data.status === "ROTATED") {
-      accessTokenInMemory = data.access_token;
-      previousRefreshToken = data.old_refresh_token;
-      document.getElementById("access-preview").textContent = accessTokenInMemory.slice(0, 36) + "... (Đã xoay vòng)";
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json();
+
+      if (res.status === 429 && data.retry_after) {
+        startLockoutCountdown(data.retry_after);
+        return;
+      }
+
+      if (!res.ok) {
+        showAlert(data.error || "Đăng nhập thất bại.", "error");
+      } else {
+        document.getElementById("display-username").textContent = data.username;
+        document.getElementById("user-avatar").textContent = data.username.charAt(0).toUpperCase();
+        document.getElementById("login-password").value = "";
+        switchTab("dashboard");
+      }
+    } catch (err) {
+      showAlert("Không thể kết nối đến máy chủ.", "error");
+    } finally {
+      if (!lockTimer) {
+        btn.disabled = false;
+        btn.textContent = "Đăng nhập";
+      }
     }
   }
 
-  async function simulateTokenReplay() {
-    if (!previousRefreshToken) {
-      alert("Hãy bấm 'Làm mới Token (/api/refresh)' ít nhất 1 lần trước để tạo ra một Refresh Token cũ!");
-      return;
-    }
-    const res = await fetch("/api/refresh", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ override_refresh_token: previousRefreshToken })
-    });
-    const data = await res.json();
-    log(`ATTACK REPLAY /api/refresh (HTTP ${res.status})`, data);
-    if (res.status === 403) {
-      document.getElementById("auth-status").textContent = "Phiên bị thu hồi khẩn cấp (Phát hiện Replay!)";
-      document.getElementById("auth-status").style.background = "#dc2626";
+  async function handleRegister(e) {
+    e.preventDefault();
+    hideAlert();
+    const btn = document.getElementById("btn-register");
+    btn.disabled = true;
+    btn.textContent = "Đang tạo tài khoản...";
+
+    const username = document.getElementById("reg-username").value;
+    const password = document.getElementById("reg-password").value;
+    const confirm_password = document.getElementById("reg-confirm").value;
+
+    try {
+      const res = await fetch("/api/register", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ username, password, confirm_password })
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        showAlert(data.error || "Đăng ký thất bại.", "error");
+      } else {
+        switchTab("login");
+        document.getElementById("login-username").value = username;
+        document.getElementById("reg-username").value = "";
+        document.getElementById("reg-password").value = "";
+        document.getElementById("reg-confirm").value = "";
+        showAlert(data.message, "success");
+      }
+    } catch (err) {
+      showAlert("Không thể kết nối đến máy chủ.", "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Đăng ký";
     }
   }
 
-  async function logout() {
-    const res = await fetch("/api/logout", { method: "POST" });
-    const data = await res.json();
-    accessTokenInMemory = null;
-    previousRefreshToken = null;
-    document.getElementById("auth-status").textContent = "Đã đăng xuất";
-    document.getElementById("auth-status").style.background = "#334155";
-    document.getElementById("access-preview").textContent = "None";
-    log(`POST /api/logout (HTTP ${res.status})`, data);
-  }
-
-  function resetFlow() {
-    document.getElementById("step-login").classList.remove("hidden");
-    document.getElementById("step-mfa").classList.add("hidden");
-    document.getElementById("captcha-container").classList.add("hidden");
-    document.getElementById("otp-input").value = "";
+  function handleLogout() {
+    switchTab("login");
   }
 </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_UI)
+
 
 if __name__ == "__main__":
-    print("Khởi chạy Demo App Login An Toàn tại: http://127.0.0.1:5000")
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
